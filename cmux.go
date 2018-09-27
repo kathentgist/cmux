@@ -233,6 +233,15 @@ func (l muxListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
+func (l muxListener) Close() error {
+	close(l.connc)
+	return l.Listener.Close()
+}
+
+func (l muxListener) Addr() net.Addr {
+	return l.Listener.Addr()
+}
+
 // MuxConn wraps a net.Conn and provides transparent sniffing of connection data.
 type MuxConn struct {
 	net.Conn
