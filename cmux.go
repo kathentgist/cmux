@@ -63,15 +63,17 @@ var ErrListenerClosed = errListenerClosed("mux: listener closed")
 
 // for readability of readTimeout
 var noTimeout time.Duration
+var defaultSniffTimeout = time.Second
 
 // New instantiates a new connection multiplexer.
 func New(l net.Listener) CMux {
 	return &cMux{
-		root:        l,
-		bufLen:      1024,
-		errh:        func(_ error) bool { return true },
-		donec:       make(chan struct{}),
-		readTimeout: noTimeout,
+		root:         l,
+		bufLen:       1024,
+		errh:         func(_ error) bool { return true },
+		donec:        make(chan struct{}),
+		readTimeout:  noTimeout,
+		sniffTimeout: defaultSniffTimeout,
 	}
 }
 
@@ -105,12 +107,13 @@ type matchersListener struct {
 }
 
 type cMux struct {
-	root        net.Listener
-	bufLen      int
-	errh        ErrorHandler
-	donec       chan struct{}
-	sls         []matchersListener
-	readTimeout time.Duration
+	root         net.Listener
+	bufLen       int
+	errh         ErrorHandler
+	donec        chan struct{}
+	sls          []matchersListener
+	readTimeout  time.Duration
+	sniffTimeout time.Duration
 }
 
 func matchersToMatchWriters(matchers []Matcher) []MatchWriter {
@@ -133,6 +136,7 @@ func (m *cMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
 	ml := muxListener{
 		Listener: m.root,
 		connc:    make(chan net.Conn, m.bufLen),
+		closeC:   make(chan struct{}),
 	}
 	m.sls = append(m.sls, matchersListener{ss: matchers, l: ml})
 	return ml
@@ -140,6 +144,10 @@ func (m *cMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
 
 func (m *cMux) SetReadTimeout(t time.Duration) {
 	m.readTimeout = t
+}
+
+func (m *cMux) SetSniffTimeout(t time.Duration) {
+	m.sniffTimeout = t
 }
 
 func (m *cMux) Serve() error {
@@ -179,20 +187,29 @@ func (m *cMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
 	if m.readTimeout > noTimeout {
 		_ = c.SetReadDeadline(time.Now().Add(m.readTimeout))
 	}
+
+	ch := make(chan bool, 1)
+	var tk = time.NewTimer(m.sniffTimeout)
+	defer tk.Stop()
+	defer close(ch)
 	for _, sl := range m.sls {
 		for _, s := range sl.ss {
-			matched := s(muc.Conn, muc.startSniffing())
-			if matched {
-				muc.doneSniffing()
-				if m.readTimeout > noTimeout {
-					_ = c.SetReadDeadline(time.Time{})
+			tk.Reset(m.sniffTimeout)
+			select {
+			case ch <- s(muc.Conn, muc.startSniffing()):
+				if matched := <-ch; matched {
+					muc.doneSniffing()
+					if m.readTimeout > noTimeout {
+						_ = c.SetReadDeadline(time.Time{})
+					}
+					select {
+					case sl.l.connc <- muc:
+					case <-donec:
+						_ = c.Close()
+					}
+					return
 				}
-				select {
-				case sl.l.connc <- muc:
-				case <-donec:
-					_ = c.Close()
-				}
-				return
+			case <-tk.C:
 			}
 		}
 	}
@@ -222,24 +239,26 @@ func (m *cMux) handleErr(err error) bool {
 
 type muxListener struct {
 	net.Listener
-	connc chan net.Conn
+	connc  chan net.Conn
+	closeC chan struct{}
 }
 
 func (l muxListener) Accept() (net.Conn, error) {
-	c, ok := <-l.connc
-	if !ok {
+	select {
+	case c, ok := <-l.connc:
+		if !ok {
+			return nil, ErrListenerClosed
+		}
+
+		return c, nil
+	case <-l.closeC:
 		return nil, ErrListenerClosed
 	}
-	return c, nil
 }
 
 func (l muxListener) Close() error {
-	close(l.connc)
+	close(l.closeC)
 	return l.Listener.Close()
-}
-
-func (l muxListener) Addr() net.Addr {
-	return l.Listener.Addr()
 }
 
 // MuxConn wraps a net.Conn and provides transparent sniffing of connection data.
